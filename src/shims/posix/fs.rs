@@ -435,6 +435,33 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         }
     }
 
+    fn read_file(&mut self, mut file: impl Read, buf: Scalar<Tag>, count: usize) -> InterpResult<'tcx, i64> {
+        let this = self.eval_context_mut();
+
+        // We want to read at most `count` bytes. We are sure that `count` is not negative
+        // because it was a target's `usize`. Also we are sure that its smaller than
+        // `usize::MAX` because it is a host's `isize`.
+        let mut bytes = vec![0; count];
+
+        let result = file
+            .read(&mut bytes)
+        // `File::read` never returns a value larger than `count`, so this cannot fail.
+            .map(|c| i64::try_from(c).unwrap());
+
+        match result {
+            Ok(read_bytes) => {
+                // If reading to `bytes` did not fail, we write those bytes to the buffer.
+                this.memory.write_bytes(buf, bytes)?;
+                Ok(read_bytes)
+            }
+            Err(e) => {
+                this.set_last_error_from_io_error(e)?;
+                Ok(-1)
+            }
+
+        }
+    }
+
     fn read(
         &mut self,
         fd: i32,
@@ -444,7 +471,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let this = self.eval_context_mut();
 
         this.check_no_isolation("read")?;
-        assert!(fd >= 3);
+        assert!(fd == 0 || fd >= 3);
 
         trace!("Reading from FD {}, size {}", fd, count);
 
@@ -457,33 +484,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         // We cap the number of read bytes to the largest value that we are able to fit in both the
         // host's and target's `isize`. This saves us from having to handle overflows later.
-        let count = count.min(this.machine_isize_max() as u64).min(isize::MAX as u64);
+        let count = count
+            .min(this.machine_isize_max() as u64)
+            .min(isize::MAX as u64);
+        // This can never fail because `count` was capped to be smaller than
+        // `isize::MAX`.
+        let count = isize::try_from(count).unwrap();
 
-        if let Some(FileHandle { file, writable: _ }) = this.machine.file_handler.handles.get_mut(&fd) {
+        if fd == 0 {
+            self.read_file(std::io::stdin(), buf, count as usize)
+        } else if let Some(FileHandle { file, writable: _ }) = this.machine.file_handler.handles.get_mut(&fd) {
             trace!("read: FD mapped to {:?}", file);
-            // This can never fail because `count` was capped to be smaller than
-            // `isize::MAX`.
-            let count = isize::try_from(count).unwrap();
-            // We want to read at most `count` bytes. We are sure that `count` is not negative
-            // because it was a target's `usize`. Also we are sure that its smaller than
-            // `usize::MAX` because it is a host's `isize`.
-            let mut bytes = vec![0; count as usize];
-            let result = file
-                .read(&mut bytes)
-                // `File::read` never returns a value larger than `count`, so this cannot fail.
-                .map(|c| i64::try_from(c).unwrap());
-
-            match result {
-                Ok(read_bytes) => {
-                    // If reading to `bytes` did not fail, we write those bytes to the buffer.
-                    this.memory.write_bytes(buf, bytes)?;
-                    Ok(read_bytes)
-                }
-                Err(e) => {
-                    this.set_last_error_from_io_error(e)?;
-                    Ok(-1)
-                }
-            }
+            // self.read_file(file, buf, count as usize)
+            panic!("FIXME")
         } else {
             trace!("read: FD not found");
             this.handle_not_found()
@@ -701,13 +714,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         // found this error, please open an issue reporting it.
         if !(
             path.is_absolute() ||
-            dirfd == this.eval_libc_i32("AT_FDCWD")? ||
-            (path.as_os_str().is_empty() && empty_path_flag)
+                dirfd == this.eval_libc_i32("AT_FDCWD")? ||
+                (path.as_os_str().is_empty() && empty_path_flag)
         ) {
             throw_unsup_format!(
                 "using statx is only supported with absolute paths, relative paths with the file \
-                descriptor `AT_FDCWD`, and empty paths with the `AT_EMPTY_PATH` flag set and any \
-                file descriptor"
+                 descriptor `AT_FDCWD`, and empty paths with the `AT_EMPTY_PATH` flag set and any \
+                 file descriptor"
             )
         }
 

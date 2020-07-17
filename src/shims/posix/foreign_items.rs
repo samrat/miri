@@ -66,20 +66,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let fd = this.read_scalar(fd)?.to_i32()?;
                 let buf = this.read_scalar(buf)?.not_undef()?;
                 let count = this.read_scalar(count)?.to_machine_usize(this)?;
-                let result = if fd == 0 {
-                    use std::io::{self, Read};
-
-                    let mut buffer = String::new();
-                    let res = io::stdin().read_to_string(&mut buffer);
-
-                    match res {
-                        Ok(bytes) => {
-                            this.memory.write_bytes(buf, buffer.bytes())?;
-                            i64::try_from(bytes).unwrap()
-                        },
-                        Err(_) => -1,
-                    }
-                } else if fd == 1 || fd == 2 {
+                let result = if fd == 1 || fd == 2 {
                     throw_unsup_format!("cannot read from stdout/stderr")
                 } else {
                     this.read(fd, buf, count)?
