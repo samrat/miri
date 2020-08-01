@@ -67,39 +67,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 let fd = this.read_scalar(fd)?.to_i32()?;
                 let buf = this.read_scalar(buf)?.not_undef()?;
                 let count = this.read_scalar(count)?.to_machine_usize(this)?;
-                let result = if fd == 0 {
-
-                    this.check_no_isolation("read")?;
-
-                    // We cap the number of read bytes to the largest
-                    // value that we are able to fit in both the
-                    // host's and target's `isize`. This saves us from
-                    // having to handle overflows later.
-                    let count = count.min(this.machine_isize_max() as u64).min(isize::MAX as u64);
-
-                    // We want to read at most `count` bytes. We are
-                    // sure that `count` is not negative because it
-                    // was a target's `usize`. Also we are sure that
-                    // its smaller than `usize::MAX` because it is a
-                    // host's `isize`.
-                    let mut buffer = vec![0; count as usize];
-                    let res = io::stdin()
-                        .read(&mut buffer)
-                        // `Stdin::read` never returns a value larger
-                        // than `count`, so this cannot fail.
-                        .map(|c| i64::try_from(c).unwrap());
-
-                    match res {
-                        Ok(bytes) => {
-                            this.memory.write_bytes(buf, buffer)?;
-                            i64::try_from(bytes).unwrap()
-                        },
-                        Err(e) => {
-                            this.set_last_error_from_io_error(e)?;
-                            -1
-                        },
-                    }
-                } else if fd == 1 || fd == 2 {
+                let result = if fd == 1 || fd == 2 {
                     throw_unsup_format!("cannot read from stdout/stderr")
                 } else {
                     this.read(fd, buf, count)?

@@ -48,9 +48,75 @@ impl<'tcx> FileDescriptor<'tcx> for FileHandle {
     }
 }
 
-#[derive(Debug, Default)]
+impl<'tcx> FileDescriptor<'tcx> for io::Stdin {
+    fn as_file_handle(&self) -> InterpResult<'tcx, &FileHandle> {
+        unimplemented!()
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> Result<usize, io::Error> {
+        Read::read(self, bytes)
+    }
+
+    fn write(&mut self, _bytes: &[u8]) -> Result<usize, io::Error> {
+        unimplemented!()
+    }
+
+    fn seek(&mut self, offset: SeekFrom) -> Result<u64, io::Error> {
+        unimplemented!()
+    }
+}
+
+impl<'tcx> FileDescriptor<'tcx> for io::Stdout {
+    fn as_file_handle(&self) -> InterpResult<'tcx, &FileHandle> {
+        unimplemented!()
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> Result<usize, io::Error> {
+        unimplemented!()
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, io::Error> {
+        Write::write(self, bytes)
+    }
+
+    fn seek(&mut self, offset: SeekFrom) -> Result<u64, io::Error> {
+        unimplemented!()
+    }
+}
+
+impl<'tcx> FileDescriptor<'tcx> for io::Stderr {
+    fn as_file_handle(&self) -> InterpResult<'tcx, &FileHandle> {
+        unimplemented!()
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> Result<usize, io::Error> {
+        unimplemented!()
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, io::Error> {
+        Write::write(self, bytes)
+    }
+
+    fn seek(&mut self, offset: SeekFrom) -> Result<u64, io::Error> {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug)]
 pub struct FileHandler<'tcx> {
     handles: BTreeMap<i32, Box<dyn FileDescriptor<'tcx>>>,
+}
+
+impl<'tcx> Default for FileHandler<'tcx> {
+    fn default() -> Self {
+        let mut handles = BTreeMap::new();
+        handles.insert(0i32, Box::new(io::stdin()) as Box<dyn FileDescriptor<'_>>);
+        handles.insert(1i32, Box::new(io::stdout()) as Box<dyn FileDescriptor<'_>>);
+        handles.insert(2i32, Box::new(io::stderr()) as Box<dyn FileDescriptor<'_>>);
+        FileHandler {
+            handles
+        }
+    }
 }
 
 
@@ -485,7 +551,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let this = self.eval_context_mut();
 
         this.check_no_isolation("read")?;
-        assert!(fd >= 3);
 
         trace!("Reading from FD {}, size {}", fd, count);
 
