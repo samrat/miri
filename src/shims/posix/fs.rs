@@ -23,28 +23,37 @@ struct FileHandle {
 }
 
 trait FileDescriptor<'tcx> : std::fmt::Debug {
-    fn as_file_handle(&self) -> InterpResult<'tcx, &FileHandle>;
+    fn as_file_handle(&self) -> Option<&FileHandle>;
 
-    fn read(&mut self, bytes: &mut [u8]) -> Result<usize, io::Error>;
-    fn write(&mut self, bytes: &[u8]) -> Result<usize, io::Error>;
-    fn seek(&mut self, offset: SeekFrom) -> Result<u64, io::Error>;
+    fn read(&mut self, bytes: &mut [u8]) -> InterpResult<'tcx, usize>;
+    fn write(&mut self, bytes: &[u8]) -> InterpResult<'tcx, usize>;
+    fn seek(&mut self, offset: SeekFrom) -> InterpResult<'tcx, u64>;
 }
 
 impl<'tcx> FileDescriptor<'tcx> for FileHandle {
-    fn as_file_handle(&self) -> InterpResult<'tcx, &FileHandle> {
-        Ok(&self)
+    fn as_file_handle(&self) -> Option<&FileHandle> {
+        Some(&self)
     }
 
-    fn read(&mut self, bytes: &mut [u8]) -> Result<usize, io::Error> {
-        self.file.read(bytes)
+    fn read(&mut self, bytes: &mut [u8]) -> InterpResult<'tcx, usize> {
+        match self.file.read(bytes) {
+            Ok(count) => Ok(count),
+            Err(e) => throw_unsup_format!("cannot read from stdout/stderr")
+        }
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<usize, io::Error> {
-        self.file.write(bytes)
+    fn write(&mut self, bytes: &[u8]) -> InterpResult<'tcx, usize> {
+        match self.file.write(bytes) {
+            Ok(count) => Ok(count),
+            Err(_) => throw_unsup_format!("cannot write to stdin")
+        }
     }
 
-    fn seek(&mut self, offset: SeekFrom) -> Result<u64, io::Error> {
-        self.file.seek(offset)
+    fn seek(&mut self, offset: SeekFrom) -> InterpResult<'tcx, u64> {
+        match self.file.seek(offset) {
+            Ok(n) => Ok(n),
+            Err(_) => unimplemented!()
+        }
     }
 }
 
@@ -411,8 +420,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             let fh = &mut this.machine.file_handler;
             let (file_result, writable) = match fh.handles.get(&fd) {
                 Some(file_descriptor) => match file_descriptor.as_file_handle() {
-                    Ok(FileHandle { file, writable }) => (file.try_clone(), writable.clone()),
-                    Err(_) => return this.handle_not_found(),
+                    Some(FileHandle { file, writable }) => (file.try_clone(), writable.clone()),
+                    None => return this.handle_not_found(),
                 },
                 None => return this.handle_not_found(),
             };
@@ -426,11 +435,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             let &[_, _] = check_arg_count(args)?;
             if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
                 match file_descriptor.as_file_handle() {
-                    Ok(FileHandle { file, writable }) => {
+                    Some(FileHandle { file, writable }) => {
                         let io_result = maybe_sync_file(&file, *writable, File::sync_all);
                         this.try_unwrap_io_result(io_result)
                     },
-                    Err(_) => this.handle_not_found(),
+                    None => this.handle_not_found(),
                 }
             } else {
                 this.handle_not_found()
@@ -447,9 +456,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
 
-        if let Some(file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
-            match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable }) => {
+        if let Some(FileHandle { file, writable }) = this.machine.file_handler.handles.remove(&fd)
+            .and_then(FileDescriptor::as_file_handle) {
                     // We sync the file if it was opened in a mode different than read-only.
                     if *writable {
                         // `File::sync_all` does the checks that are done when closing a file. We do this to
@@ -468,9 +476,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         drop(file);
                         Ok(0)
                     }
-                },
-                Err(_) => this.handle_not_found()
-            }
         } else {
             this.handle_not_found()
         }
@@ -512,17 +517,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 .read(&mut bytes)
                 .map(|c| i64::try_from(c).unwrap());
 
-            match result {
-                Ok(read_bytes) => {
-                    // If reading to `bytes` did not fail, we write those bytes to the buffer.
-                    this.memory.write_bytes(buf, bytes)?;
-                    Ok(read_bytes)
-                }
-                Err(e) => {
-                    this.set_last_error_from_io_error(e)?;
-                    Ok(-1)
-                }
-            }
+            // If reading to `bytes` did not fail, we write those bytes to the buffer.
+            this.memory.write_bytes(buf, bytes)?;
+            result
         } else {
             trace!("read: FD not found");
             this.handle_not_found()
@@ -553,10 +550,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
             let bytes = this.memory.read_bytes(buf, Size::from_bytes(count))?;
-            let result = file_descriptor
+            file_descriptor
                 .write(&bytes)
-                .map(|c| i64::try_from(c).unwrap());
-            this.try_unwrap_io_result(result)
+                .map(|c| i64::try_from(c).unwrap())
+            // TODO this.try_unwrap_io_result(result)
         } else {
             this.handle_not_found()
         }
@@ -589,10 +586,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         };
 
         if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
-            let result = file_descriptor
+            file_descriptor
                 .seek(seek_from)
-                .map(|offset| i64::try_from(offset).unwrap());
-            this.try_unwrap_io_result(result)
+                .map(|offset| i64::try_from(offset).unwrap())
+            // TODO this.try_unwrap_io_result(result)
         } else {
             this.handle_not_found()
         }
@@ -1150,7 +1147,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let length = this.read_scalar(length_op)?.to_i64()?;
         if let Some(file_descriptor) = this.machine.file_handler.handles.get_mut(&fd) {
             match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable }) => {
+                Some(FileHandle { file, writable }) => {
                     if *writable {
                         if let Ok(length) = length.try_into() {
                             let result = file.set_len(length);
@@ -1167,7 +1164,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                         Ok(-1)
                     }
                 }
-                Err(_) => this.handle_not_found()
+                None => this.handle_not_found()
             }
         } else {
             this.handle_not_found()
@@ -1187,11 +1184,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let fd = this.read_scalar(fd_op)?.to_i32()?;
         if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
             match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable }) => {
+                Some(FileHandle { file, writable }) => {
                     let io_result = maybe_sync_file(&file, *writable, File::sync_all);
                     this.try_unwrap_io_result(io_result)
                 }
-                Err(_) => this.handle_not_found()
+                None => this.handle_not_found()
             }
         } else {
             this.handle_not_found()
@@ -1206,11 +1203,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let fd = this.read_scalar(fd_op)?.to_i32()?;
         if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
             match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable }) => {
+                Some(FileHandle { file, writable }) => {
                     let io_result = maybe_sync_file(&file, *writable, File::sync_data);
                     this.try_unwrap_io_result(io_result)
                 }
-                Err(_) => this.handle_not_found()
+                None => this.handle_not_found()
             }
         } else {
             this.handle_not_found()
@@ -1249,11 +1246,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         if let Some(file_descriptor) = this.machine.file_handler.handles.get(&fd) {
             match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable }) => {
+                Some(FileHandle { file, writable }) => {
                     let io_result = maybe_sync_file(&file, *writable, File::sync_data);
                     this.try_unwrap_io_result(io_result)
                 },
-                Err(_) => this.handle_not_found()
+                None => this.handle_not_found()
             }
         } else {
             this.handle_not_found()
@@ -1305,8 +1302,8 @@ impl FileMetadata {
         let option = ecx.machine.file_handler.handles.get(&fd);
         let file = match option {
             Some(file_descriptor) => match file_descriptor.as_file_handle() {
-                Ok(FileHandle { file, writable: _ }) => file,
-                Err(_) => return ecx.handle_not_found().map(|_: i32| None),
+                Some(FileHandle { file, writable: _ }) => file,
+                None => return ecx.handle_not_found().map(|_: i32| None),
             },
             None => return ecx.handle_not_found().map(|_: i32| None),
         };
