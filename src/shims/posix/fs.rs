@@ -142,11 +142,11 @@ impl<'tcx> Default for FileHandler {
 const MIN_NORMAL_FILE_FD: i32 = 3;
 
 impl<'tcx> FileHandler {
-    fn insert_fd(&mut self, file_handle: FileHandle) -> i32 {
+    fn insert_fd(&mut self, file_handle: Box<dyn FileDescriptor>) -> i32 {
         self.insert_fd_with_min_fd(file_handle, 0)
     }
 
-    fn insert_fd_with_min_fd(&mut self, file_handle: FileHandle, min_fd: i32) -> i32 {
+    fn insert_fd_with_min_fd(&mut self, file_handle: Box<dyn FileDescriptor>, min_fd: i32) -> i32 {
         let min_fd = std::cmp::max(min_fd, MIN_NORMAL_FILE_FD);
 
         // Find the lowest unused FD, starting from min_fd. If the first such unused FD is in
@@ -173,7 +173,7 @@ impl<'tcx> FileHandler {
             self.handles.last_key_value().map(|(fd, _)| fd.checked_add(1).unwrap()).unwrap_or(min_fd)
         });
 
-        self.handles.insert(new_fd, Box::new(file_handle)).unwrap_none();
+        self.handles.insert(new_fd, file_handle).unwrap_none();
         new_fd
     }
 }
@@ -449,7 +449,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         let fd = options.open(&path).map(|file| {
             let fh = &mut this.machine.file_handler;
-            fh.insert_fd(FileHandle { file, writable })
+            fh.insert_fd(Box::new(FileHandle { file, writable }))
         });
 
         this.try_unwrap_io_result(fd)
@@ -489,22 +489,32 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             // thus they can share the same implementation here.
             let &[_, _, start] = check_arg_count(args)?;
             let start = this.read_scalar(start)?.to_i32()?;
-            if fd < MIN_NORMAL_FILE_FD {
-                throw_unsup_format!("duplicating file descriptors for stdin, stdout, or stderr is not supported")
-            }
+
             let fh = &mut this.machine.file_handler;
-            let (file_result, writable) = match fh.handles.get(&fd) {
-                Some(file_descriptor) => {
-                    // FIXME: Support "dup" for all FDs(stdin, etc)
-                    let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
-                    (file.try_clone(), *writable)
-                },
-                None => return this.handle_not_found(),
-            };
-            let fd_result = file_result.map(|duplicated| {
-                fh.insert_fd_with_min_fd(FileHandle { file: duplicated, writable }, start)
-            });
-            this.try_unwrap_io_result(fd_result)
+
+            if fd < 3 {
+                let dup_fd : Box<dyn FileDescriptor> = match fd {
+                    0 => Box::new(io::stdin()),
+                    1 => Box::new(io::stdout()),
+                    2 => Box::new(io::stderr()),
+                    _ => unreachable!(),
+                };
+
+                let fd_result = fh.insert_fd_with_min_fd(dup_fd, start);
+                Ok(fd_result)
+            } else {
+                let (file_result, writable) = match fh.handles.get(&fd) {
+                    Some(file_descriptor) => {
+                        let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
+                        (file.try_clone(), *writable)
+                    },
+                    None => return this.handle_not_found(),
+                };
+                let fd_result = file_result.map(|duplicated| {
+                    fh.insert_fd_with_min_fd(Box::new(FileHandle { file: duplicated, writable }), start)
+                });
+                this.try_unwrap_io_result(fd_result)
+            }
         } else if this.tcx.sess.target.target.target_os == "macos"
             && cmd == this.eval_libc_i32("F_FULLFSYNC")?
         {
