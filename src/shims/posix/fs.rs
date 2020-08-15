@@ -28,6 +28,7 @@ trait FileDescriptor : std::fmt::Debug {
     fn read<'tcx>(&mut self, communicate_allowed: bool, bytes: &mut [u8]) -> InterpResult<'tcx, io::Result<usize>>;
     fn write<'tcx>(&mut self, communicate_allowed: bool, bytes: &[u8]) -> InterpResult<'tcx, io::Result<usize>>;
     fn seek<'tcx>(&mut self, communicate_allowed: bool, offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>>;
+    fn close<'tcx>(&mut self, communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>>;
 }
 
 impl FileDescriptor for FileHandle {
@@ -48,6 +49,29 @@ impl FileDescriptor for FileHandle {
     fn seek<'tcx>(&mut self, communicate_allowed: bool, offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>> {
         assert!(communicate_allowed, "isolation should have prevented even opening a file");
         Ok(self.file.seek(offset))
+    }
+
+    fn close<'tcx>(&mut self, communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
+        assert!(communicate_allowed, "isolation should have prevented even opening a file");
+        // We sync the file if it was opened in a mode different than read-only.
+        if self.writable {
+            // `File::sync_all` does the checks that are done when closing a file. We do this to
+            // to handle possible errors correctly.
+            let result = self.file.sync_all().map(|_| 0i32);
+            // Now we actually close the file.
+            drop(self);
+            // And return the result.
+            Ok(result)
+        } else {
+            // We drop the file, this closes it but ignores any errors
+            // produced when closing it. This is done because
+            // `File::sync_all` cannot be done over files like
+            // `/dev/urandom` which are read-only. Check
+            // https://github.com/rust-lang/miri/issues/999#issuecomment-568920439
+            // for a deeper discussion.
+            drop(self);
+            Ok(Ok(0))
+        }
     }
 }
 
@@ -70,6 +94,11 @@ impl FileDescriptor for io::Stdin {
 
     fn seek<'tcx>(&mut self, _communicate_allowed: bool, _offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>> {
         throw_unsup_format!("cannot seek on stdin");
+    }
+
+    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
+        drop(io::stdin());
+        Ok(Ok(0))
     }
 }
 
@@ -98,6 +127,11 @@ impl FileDescriptor for io::Stdout {
     fn seek<'tcx>(&mut self, _communicate_allowed: bool, _offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>> {
         throw_unsup_format!("cannot seek on stdout");
     }
+
+    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
+        drop(io::stdout());
+        Ok(Ok(0))
+    }
 }
 
 impl FileDescriptor for io::Stderr {
@@ -117,6 +151,11 @@ impl FileDescriptor for io::Stderr {
 
     fn seek<'tcx>(&mut self, _communicate_allowed: bool, _offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>> {
         throw_unsup_format!("cannot seek on stderr");
+    }
+
+    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
+        drop(io::stderr());
+        Ok(Ok(0))
     }
 }
 
@@ -539,27 +578,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
 
-        if let Some(file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
-            // FIXME: Support `close` for all FDs(stdin, etc)
-            let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
-            // We sync the file if it was opened in a mode different than read-only.
-            if *writable {
-                // `File::sync_all` does the checks that are done when closing a file. We do this to
-                // to handle possible errors correctly.
-                let result = this.try_unwrap_io_result(file.sync_all().map(|_| 0i32));
-                // Now we actually close the file.
-                drop(file);
-                // And return the result.
-                result
-            } else {
-                // We drop the file, this closes it but ignores any errors produced when closing
-                // it. This is done because `File::sync_all` cannot be done over files like
-                // `/dev/urandom` which are read-only. Check
-                // https://github.com/rust-lang/miri/issues/999#issuecomment-568920439 for a deeper
-                // discussion.
-                drop(file);
-                Ok(0)
-            }
+        if let Some(mut file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
+            let result = file_descriptor.close(this.machine.communicate)?
+            .map(|c| i32::try_from(c).unwrap());
+
+            this.try_unwrap_io_result(result)
         } else {
             this.handle_not_found()
         }
