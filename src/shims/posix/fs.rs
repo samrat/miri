@@ -531,28 +531,28 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
             let fh = &mut this.machine.file_handler;
 
-            if fd < 3 {
-                let dup_fd : Box<dyn FileDescriptor> = match fd {
-                    0 => Box::new(io::stdin()),
-                    1 => Box::new(io::stdout()),
-                    2 => Box::new(io::stderr()),
-                    _ => unreachable!(),
-                };
+            match fh.handles.get(&fd) {
+                Some(file_descriptor) => {
+                    let dup_result : io::Result<Box<dyn FileDescriptor>> =
+                        if let Ok(FileHandle { file, writable }) = file_descriptor.as_file_handle() {
+                            file.try_clone()
+                                .map(|dup_file|
+                                     Box::new(FileHandle { file: dup_file,
+                                                           writable: *writable }) as Box<dyn FileDescriptor>)
+                        } else {
+                            match fd {
+                                0 => Ok(Box::new(io::stdin())),
+                                1 => Ok(Box::new(io::stdout())),
+                                2 => Ok(Box::new(io::stderr())),
+                                _ => return this.handle_not_found(),
+                            }
+                        };
 
-                let fd_result = fh.insert_fd_with_min_fd(dup_fd, start);
-                Ok(fd_result)
-            } else {
-                let (file_result, writable) = match fh.handles.get(&fd) {
-                    Some(file_descriptor) => {
-                        let FileHandle { file, writable } = file_descriptor.as_file_handle()?;
-                        (file.try_clone(), *writable)
-                    },
-                    None => return this.handle_not_found(),
-                };
-                let fd_result = file_result.map(|duplicated| {
-                    fh.insert_fd_with_min_fd(Box::new(FileHandle { file: duplicated, writable }), start)
-                });
-                this.try_unwrap_io_result(fd_result)
+                    let fd_result = dup_result.map(|dup_fd|
+                                                   fh.insert_fd_with_min_fd(dup_fd, start));
+                    this.try_unwrap_io_result(fd_result)
+                },
+                None => return this.handle_not_found(),
             }
         } else if this.tcx.sess.target.target.target_os == "macos"
             && cmd == this.eval_libc_i32("F_FULLFSYNC")?
@@ -579,8 +579,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let fd = this.read_scalar(fd_op)?.to_i32()?;
 
         if let Some(mut file_descriptor) = this.machine.file_handler.handles.remove(&fd) {
-            let result = file_descriptor.close(this.machine.communicate)?
-            .map(|c| i32::try_from(c).unwrap());
+            let result = file_descriptor.close(this.machine.communicate)?;
 
             this.try_unwrap_io_result(result)
         } else {
