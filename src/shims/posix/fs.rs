@@ -28,7 +28,11 @@ trait FileDescriptor : std::fmt::Debug {
     fn read<'tcx>(&mut self, communicate_allowed: bool, bytes: &mut [u8]) -> InterpResult<'tcx, io::Result<usize>>;
     fn write<'tcx>(&mut self, communicate_allowed: bool, bytes: &[u8]) -> InterpResult<'tcx, io::Result<usize>>;
     fn seek<'tcx>(&mut self, communicate_allowed: bool, offset: SeekFrom) -> InterpResult<'tcx, io::Result<u64>>;
-    fn close<'tcx>(&mut self, communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>>;
+    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
+        throw_unsup_format!("stdin/stdout/stderr cannot be closed(not supported by Rust)");
+    }
+
+    fn dup<'tcx>(&mut self) -> InterpResult<'tcx, Box<dyn FileDescriptor>>;
 }
 
 impl FileDescriptor for FileHandle {
@@ -73,6 +77,18 @@ impl FileDescriptor for FileHandle {
             Ok(Ok(0))
         }
     }
+
+    fn dup<'tcx>(&mut self) -> InterpResult<'tcx, Box<dyn FileDescriptor>> {
+        if let Ok(FileHandle { file, writable }) = self.as_file_handle() {
+            if let Ok(duplicated) = file.try_clone() {
+                Ok(Box::new(FileHandle { file: duplicated, writable: *writable }))
+            } else {
+                unimplemented!()
+            }
+        } else {
+            panic!("TODO")
+        }
+    }
 }
 
 impl FileDescriptor for io::Stdin {
@@ -96,9 +112,8 @@ impl FileDescriptor for io::Stdin {
         throw_unsup_format!("cannot seek on stdin");
     }
 
-    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
-        drop(io::stdin());
-        Ok(Ok(0))
+    fn dup<'tcx>(&mut self) -> InterpResult<'tcx, Box<dyn FileDescriptor>> {
+        Ok(Box::new(io::stdin()))
     }
 }
 
@@ -128,9 +143,8 @@ impl FileDescriptor for io::Stdout {
         throw_unsup_format!("cannot seek on stdout");
     }
 
-    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
-        drop(io::stdout());
-        Ok(Ok(0))
+    fn dup<'tcx>(&mut self) -> InterpResult<'tcx, Box<dyn FileDescriptor>> {
+        Ok(Box::new(io::stdout()))
     }
 }
 
@@ -153,9 +167,8 @@ impl FileDescriptor for io::Stderr {
         throw_unsup_format!("cannot seek on stderr");
     }
 
-    fn close<'tcx>(&mut self, _communicate_allowed: bool) -> InterpResult<'tcx, io::Result<i32>> {
-        drop(io::stderr());
-        Ok(Ok(0))
+    fn dup<'tcx>(&mut self) -> InterpResult<'tcx, Box<dyn FileDescriptor>> {
+        Ok(Box::new(io::stderr()))
     }
 }
 
@@ -531,26 +544,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
             let fh = &mut this.machine.file_handler;
 
-            match fh.handles.get(&fd) {
+            match fh.handles.get_mut(&fd) {
                 Some(file_descriptor) => {
-                    let dup_result : io::Result<Box<dyn FileDescriptor>> =
-                        if let Ok(FileHandle { file, writable }) = file_descriptor.as_file_handle() {
-                            file.try_clone()
-                                .map(|dup_file|
-                                     Box::new(FileHandle { file: dup_file,
-                                                           writable: *writable }) as Box<dyn FileDescriptor>)
-                        } else {
-                            match fd {
-                                0 => Ok(Box::new(io::stdin())),
-                                1 => Ok(Box::new(io::stdout())),
-                                2 => Ok(Box::new(io::stderr())),
-                                _ => return this.handle_not_found(),
-                            }
-                        };
-
-                    let fd_result = dup_result.map(|dup_fd|
-                                                   fh.insert_fd_with_min_fd(dup_fd, start));
-                    this.try_unwrap_io_result(fd_result)
+                    let dup_result = file_descriptor.dup();
+                    dup_result.map(|dup_fd|
+                                   fh.insert_fd_with_min_fd(dup_fd, start))
                 },
                 None => return this.handle_not_found(),
             }
